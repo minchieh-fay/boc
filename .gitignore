@@ -24,9 +24,20 @@ profile.cov
 go.work
 go.work.sum
 
+# Runtime and local configuration
+config.json
+state.json
+*.key
+
 # env file
 .env
 
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# tmp
+boc-linux-amd64
+config.json
+[0-9].tmp
+[0-9].md

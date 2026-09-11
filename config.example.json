@@ -1,0 +1,9 @@
+{
+  "symbol": "ETHUSDC",
+  "quantity": "0.1",
+  "intervals": ["1h", "2h"],
+  "boll_period": 20,
+  "boll_stddev": 2,
+  "state_file": "/app/data/state.json",
+  "error_retry_seconds": 60
+}
