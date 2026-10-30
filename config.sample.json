@@ -1,0 +1,14 @@
+{
+  "keyfile": "/root/key",
+  "interval_minutes": 5,
+  "trade_usdt": 100,
+  "max_symbols": 2,
+  "take_profit_rate": 0.04,
+  "stop_loss_rate": 0.02,
+  "min_move_rate": 0.05,
+  "strategy": "trend",
+  "leverage": 1,
+  "testnet": false,
+  "receive_window_millis": 5000,
+  "stale_price_seconds": 30
+}

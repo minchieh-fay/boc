@@ -27,6 +27,7 @@ go.work.sum
 # Runtime and local configuration
 config.json
 state.json
+data/
 *.key
 
 # env file
