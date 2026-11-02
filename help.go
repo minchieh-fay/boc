@@ -46,11 +46,8 @@ func help_logTrade(symbol, direction string, entry, movement, quantity float64) 
 		symbol, direction, entry, movement*100, quantity, time.Now().Format(time.RFC3339))
 }
 
-// help_apiErrorCode 从包装后的 SDK 错误中提取 Binance API 错误码。
-func help_apiErrorCode(err error) (int64, bool) {
+// help_isPostOnlyCross 识别 Binance 因 GTX 订单会立即成交而返回的拒单错误。
+func help_isPostOnlyCross(err error) bool {
 	var apiErr *common.APIError
-	if errors.As(err, &apiErr) && apiErr.IsValid() {
-		return apiErr.Code, true
-	}
-	return 0, false
+	return errors.As(err, &apiErr) && apiErr.IsValid() && apiErr.Code == -5022
 }

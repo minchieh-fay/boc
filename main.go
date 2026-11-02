@@ -13,7 +13,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	app, err := newApplication("config.json", "data/state.json")
+	app, err := newApplication("config.json")
 	if err != nil {
 		log.Fatal(err)
 	}
