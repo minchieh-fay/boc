@@ -62,9 +62,9 @@ func (c Config) validate() error {
 	if c.KlineCount > 1499 {
 		return fmt.Errorf("kline_count 不能超过 1499，以便额外请求当前未收盘 K 线")
 	}
-	if c.TradeMode < 0 || c.TradeMode > 2 || c.EntryRepriceSeconds <= 0 ||
+	if c.TradeMode < 0 || c.TradeMode > 3 || c.EntryRepriceSeconds <= 0 ||
 		c.EntryRepriceSeconds < 0.1 || float64(c.EntryTimeoutSeconds) < c.EntryRepriceSeconds {
-		return fmt.Errorf("trade_mode 必须为 0、1 或 2，重挂间隔至少 0.1 秒且不能超过挂单超时")
+		return fmt.Errorf("trade_mode 必须为 0、1、2 或 3，重挂间隔至少 0.1 秒且不能超过挂单超时")
 	}
 	if c.TradeMode == 2 && c.MaxSymbols < 2 {
 		return fmt.Errorf("双向模式下 max_symbols 至少为 2")

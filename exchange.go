@@ -37,7 +37,7 @@ func NewExchange(cfg Config, market *MarketData) (*Exchange, error) {
 	return &Exchange{client: client, cfg: cfg, market: market}, nil
 }
 
-// Initialize 加载可交易合约，并确保账户处于双向持仓模式。
+// Initialize 加载可交易合约信息和本地下单规则。
 func (e *Exchange) Initialize(ctx context.Context) ([]string, error) {
 	// step.1 加载交易所合约信息及本地下单过滤规则。
 	info, err := e.client.NewExchangeInfoService().Do(ctx)
@@ -47,10 +47,6 @@ func (e *Exchange) Initialize(ctx context.Context) ([]string, error) {
 	symbols := e.market.LoadSymbols(info.Symbols)
 	if len(symbols) == 0 {
 		return nil, fmt.Errorf("未找到带有有效过滤规则的 USDT 永续合约")
-	}
-	// step.2 开启双向持仓，确保 LONG 和 SHORT 订单参数可用。
-	if err := e.client.NewChangePositionModeService().DualSide(true).Do(ctx); err != nil && !strings.Contains(err.Error(), "No need to change position side") {
-		return nil, fmt.Errorf("启用双向持仓失败: %w", err)
 	}
 	return symbols, nil
 }
@@ -114,7 +110,7 @@ func (e *Exchange) Positions(ctx context.Context) (map[string]bool, int, error) 
 }
 
 // Open 按方向配置以 GTX 限价单开仓，并为成交仓位创建保护单。
-func (e *Exchange) Open(ctx context.Context, symbol string, price float64) error {
+func (e *Exchange) Open(ctx context.Context, symbol string, price float64, tradeMode int) error {
 	// step.1 校验交易规则、设置杠杆并解析需要交易的方向。
 	filter, ok := e.market.Filter(symbol)
 	if !ok || price <= 0 {
@@ -124,7 +120,7 @@ func (e *Exchange) Open(ctx context.Context, symbol string, price float64) error
 		Leverage(e.cfg.Leverage).Do(ctx); err != nil {
 		return fmt.Errorf("%s 设置杠杆失败: %w", symbol, err)
 	}
-	directions := tradeDirections(e.cfg.TradeMode)
+	directions := tradeDirections(tradeMode)
 	// step.2 逐个方向维护 maker 入场单，并为实际成交数量挂保护单。
 	for _, direction := range directions {
 		if err := e.openDirection(ctx, symbol, price, filter, direction); err != nil {

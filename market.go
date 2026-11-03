@@ -202,6 +202,34 @@ func (m *MarketData) LastPrice(symbol string) (float64, bool) {
 	return queue.LastPrice, true
 }
 
+// TrendMode 比较历史队列前后两段的 High 总和并返回单边交易模式。
+func (m *MarketData) TrendMode(symbol string) (int, bool) {
+	// step.1 取得完整历史窗口并按照策略定义切分前后两段。
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	queue, ok := m.queues[symbol]
+	if !ok || len(queue.Data) != m.count || m.count < 2 {
+		return 0, false
+	}
+	frontCount := (m.count + 1) / 2
+	frontHigh, backHigh := 0.0, 0.0
+	for index, kline := range queue.Data {
+		if index < frontCount {
+			frontHigh += kline.High
+			continue
+		}
+		backHigh += kline.High
+	}
+	if m.count%2 == 1 {
+		backHigh += queue.Data[m.count-1].High
+	}
+	// step.2 后半段总和变大时做多，否则做空。
+	if backHigh > frontHigh {
+		return 0, true
+	}
+	return 1, true
+}
+
 // MoveCandidate 表示满足振幅门槛的交易对及其振幅。
 type MoveCandidate struct {
 	Symbol string

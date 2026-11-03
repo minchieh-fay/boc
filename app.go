@@ -106,21 +106,29 @@ func (a *Application) handleTradeCycle(ctx context.Context) {
 			continue
 		}
 		directionCount := 1
+		tradeMode := a.cfg.TradeMode
 		if a.cfg.TradeMode == 2 {
 			directionCount = 2
+		} else if a.cfg.TradeMode == 3 {
+			var ok bool
+			tradeMode, ok = a.market.TrendMode(candidate.Symbol)
+			if !ok {
+				log.Printf("trend signal skipped symbol=%s: incomplete kline window", candidate.Symbol)
+				continue
+			}
 		}
 		if positionCount+directionCount > a.cfg.MaxSymbols {
 			break
 		}
 		// step.3 按配置方向使用 GTX 限价挂单开仓并挂保护单。
-		openErr := a.exchange.Open(ctx, candidate.Symbol, candidate.Price)
+		openErr := a.exchange.Open(ctx, candidate.Symbol, candidate.Price, tradeMode)
 		if openErr != nil {
 			log.Printf("open skipped symbol=%s range=%.4f%%: %v",
 				candidate.Symbol, candidate.Rate*100, openErr)
 		} else {
 			openedSymbols[candidate.Symbol] = true
 			log.Printf("opened symbol=%s mode=%d range=%.4f%%",
-				candidate.Symbol, a.cfg.TradeMode, candidate.Rate*100)
+				candidate.Symbol, tradeMode, candidate.Rate*100)
 		}
 		positions, positionCount, err = a.exchange.Positions(ctx)
 		if err != nil {
