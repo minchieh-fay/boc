@@ -39,6 +39,7 @@ type PositionState struct {
 	StopLossAlgoID      int64                    `json:"stop_loss_algo_id"`
 	ProfitTargetReached bool                     `json:"profit_target_reached"`
 	ExitStarted         bool                     `json:"exit_started"`
+	StopRefreshPending  bool                     `json:"stop_refresh_pending"`
 }
 
 // NewExchange 从两行密钥文件创建 Binance USDⓈ-M 合约客户端。
@@ -659,10 +660,8 @@ func (e *Exchange) manageLongPosition(
 	filter SymbolFilter, direction orderDirection,
 	openAlgoOrders map[int64]futures.GetAlgoOrderResp,
 ) error {
-	if quantity >= state.Quantity-1e-12 {
-		if state.TakeProfitAlgoID == 0 {
-			return nil
-		}
+	quantityReduced := quantity < state.Quantity-1e-12 || state.StopRefreshPending
+	if !quantityReduced && state.TakeProfitAlgoID != 0 {
 		if _, active := openAlgoOrders[state.TakeProfitAlgoID]; active {
 			return nil
 		}
@@ -695,73 +694,94 @@ func (e *Exchange) manageLongPosition(
 				return nil
 			}
 		}
+		state.TakeProfitAlgoID = 0
+		state.AnchorPrice = price
 	}
-	state.Quantity = quantity
-	if state.TakeProfitAlgoID != 0 {
+	if quantityReduced {
+		// step.1 止盈成交后先撤销旧止盈和旧止损，避免重复 closePosition 条件单。
+		if err := e.cancelManagedAlgoOrder(ctx, state.TakeProfitAlgoID, openAlgoOrders); err != nil {
+			return fmt.Errorf("撤销旧止盈单失败: %w", err)
+		}
+		if err := e.cancelManagedAlgoOrder(ctx, state.StopLossAlgoID, openAlgoOrders); err != nil {
+			return fmt.Errorf("撤销旧止损单失败: %w", err)
+		}
+		// step.2 创建新止损并先保存余仓状态，保证后续失败时可以单独补挂止盈。
+		stopPrice := help_nearestStep(price*(1-e.cfg.StopLossRate), filter.PriceTick)
 		if err := waitPositionRequest(ctx); err != nil {
 			return err
 		}
-		if cancelErr := e.cancelAlgoOrder(ctx, state.TakeProfitAlgoID); cancelErr != nil {
-			if err := waitPositionRequest(ctx); err != nil {
-				return err
-			}
-			order, queryErr := e.client.NewGetAlgoOrderService().
-				AlgoID(state.TakeProfitAlgoID).Do(ctx)
-			if queryErr != nil {
-				return fmt.Errorf("撤销旧止盈单失败: %v；查询订单状态失败: %w", cancelErr, queryErr)
-			}
-			if order.AlgoStatus == futures.AlgoOrderStatusTypeNew {
-				return cancelErr
-			}
-			if order.ActualOrderId != "" {
-				actualID, parseErr := strconv.ParseInt(order.ActualOrderId, 10, 64)
-				if parseErr != nil {
-					return fmt.Errorf("解析止盈触发订单编号: %w", parseErr)
-				}
-				if err := waitPositionRequest(ctx); err != nil {
-					return err
-				}
-				actual, queryErr := e.client.NewGetOrderService().Symbol(state.Symbol).
-					OrderID(actualID).Do(ctx)
-				if queryErr != nil {
-					return queryErr
-				}
-				if actual.Status == futures.OrderStatusTypeNew ||
-					actual.Status == futures.OrderStatusTypePartiallyFilled {
-					return cancelErr
-				}
-			}
+		stop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
+		if err != nil {
+			state.Quantity = quantity
+			state.AnchorPrice = price
+			state.TakeProfitAlgoID = 0
+			state.StopRefreshPending = true
+			return e.restoreLongStop(ctx, state, filter, direction, err)
+		}
+		state.Quantity = quantity
+		state.AnchorPrice = price
+		state.StopLossPrice = stopPrice
+		state.StopLossAlgoID = stop.AlgoId
+		state.TakeProfitAlgoID = 0
+		state.StopRefreshPending = false
+		if err := e.savePositionState(state); err != nil {
+			return fmt.Errorf("新止损已创建但保存持仓状态失败: %w", err)
 		}
 	}
-	// step.1 先创建基于最新报价的新止损，再撤销旧止损保护。
-	stopPrice := help_nearestStep(price*(1-e.cfg.StopLossRate), filter.PriceTick)
+	if state.TakeProfitAlgoID == 0 {
+		// step.3 缺少活动止盈单时仅补挂止盈，不重复创建全量止损。
+		anchor := state.AnchorPrice
+		if anchor <= 0 {
+			anchor = price
+		}
+		state.Quantity = quantity
+		if err := waitPositionRequest(ctx); err != nil {
+			return err
+		}
+		updated, err := e.replaceLongTakeProfit(ctx, state, anchor, quantity, filter, direction)
+		if err != nil {
+			return err
+		}
+		return e.savePositionState(updated)
+	}
+	return nil
+}
+
+// cancelManagedAlgoOrder 仅撤销批量快照中仍活动的条件单。
+func (e *Exchange) cancelManagedAlgoOrder(
+	ctx context.Context, algoID int64, openAlgoOrders map[int64]futures.GetAlgoOrderResp,
+) error {
+	if algoID == 0 {
+		return nil
+	}
+	if _, active := openAlgoOrders[algoID]; !active {
+		return nil
+	}
 	if err := waitPositionRequest(ctx); err != nil {
 		return err
 	}
-	stop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
-	if err != nil {
-		return err
+	return e.cancelAlgoOrder(ctx, algoID)
+}
+
+// restoreLongStop 在新止损创建失败时恢复旧触发价，避免余仓失去止损保护。
+func (e *Exchange) restoreLongStop(
+	ctx context.Context, state PositionState, filter SymbolFilter,
+	direction orderDirection, cause error,
+) error {
+	// step.1 新止损创建失败时按旧触发价恢复全量保护。
+	if err := waitPositionRequest(ctx); err != nil {
+		return fmt.Errorf("新止损失败: %v；恢复旧止损等待失败: %w", cause, err)
 	}
-	oldStopID := state.StopLossAlgoID
+	stop, err := e.createStopLoss(ctx, state.Symbol, state.StopLossPrice, filter, direction)
+	if err != nil {
+		return fmt.Errorf("新止损失败: %v；恢复旧止损也失败: %w", cause, err)
+	}
+	// step.2 保存恢复后的条件单编号，并报告新止损失败供下一轮重试。
 	state.StopLossAlgoID = stop.AlgoId
-	state.StopLossPrice = stopPrice
-	// step.2 按当前剩余数量创建下一张部分止盈单并持久化新状态。
-	if err := waitPositionRequest(ctx); err != nil {
-		_ = e.cancelAlgoOrder(ctx, stop.AlgoId)
-		return err
+	if saveErr := e.savePositionState(state); saveErr != nil {
+		return fmt.Errorf("新止损失败: %v；恢复止损已创建但保存状态失败: %w", cause, saveErr)
 	}
-	state, err = e.replaceLongTakeProfit(ctx, state, price, quantity, filter, direction)
-	if err != nil {
-		_ = e.cancelAlgoOrder(ctx, stop.AlgoId)
-		return err
-	}
-	if err := e.savePositionState(state); err != nil {
-		return err
-	}
-	if err := waitPositionRequest(ctx); err != nil {
-		return err
-	}
-	return e.cancelAlgoOrder(ctx, oldStopID)
+	return fmt.Errorf("新止损创建失败，已恢复原止损: %w", cause)
 }
 
 // manageShortPosition 按空头盈利阈值判断继续持有或启动限价平仓。
