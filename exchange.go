@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adshao/go-binance/v2/futures"
@@ -22,7 +23,7 @@ type Exchange struct {
 	cfg           Config
 	market        *MarketData
 	stateMu       sync.Mutex
-	manageMu      sync.Mutex
+	managing      atomic.Bool
 	positionState map[string]PositionState
 }
 
@@ -275,6 +276,20 @@ func (e *Exchange) placeAndReprice(ctx context.Context, symbol, quantity string,
 // waitAndCancelEntry 等待一个报价周期，读取最终成交并取消未成交余量。
 func (e *Exchange) waitAndCancelEntry(ctx context.Context, symbol string, orderID int64,
 	duration time.Duration) (*futures.Order, error) {
+	return e.waitAndCancelEntryPaced(ctx, symbol, orderID, duration, 0)
+}
+
+// waitAndCancelManagedEntry 为持仓退出单限速等待并确认撤单后的最终成交。
+func (e *Exchange) waitAndCancelManagedEntry(
+	ctx context.Context, symbol string, orderID int64, duration time.Duration,
+) (*futures.Order, error) {
+	return e.waitAndCancelEntryPaced(ctx, symbol, orderID, duration, 100*time.Millisecond)
+}
+
+// waitAndCancelEntryPaced 等待报价周期后撤单，并按指定间隔查询最终状态。
+func (e *Exchange) waitAndCancelEntryPaced(
+	ctx context.Context, symbol string, orderID int64, duration, requestDelay time.Duration,
+) (*futures.Order, error) {
 	// step.1 在重挂周期内轮询订单状态，到期撤销剩余数量。
 	timer := time.NewTimer(duration)
 	defer timer.Stop()
@@ -282,19 +297,25 @@ func (e *Exchange) waitAndCancelEntry(ctx context.Context, symbol string, orderI
 	case <-ctx.Done():
 		cancelCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return e.cancelAndReadEntry(cancelCtx, symbol, orderID)
+		return e.cancelAndReadEntry(cancelCtx, symbol, orderID, requestDelay)
 	case <-timer.C:
 	}
-	return e.cancelAndReadEntry(ctx, symbol, orderID)
+	// step.2 到期或退出时撤单，并读取已成交数量供后续重挂。
+	return e.cancelAndReadEntry(ctx, symbol, orderID, requestDelay)
 }
 
 // cancelAndReadEntry 确认挂单已结束后返回最终成交，避免旧报价仍留在市场。
 func (e *Exchange) cancelAndReadEntry(ctx context.Context, symbol string,
-	orderID int64) (*futures.Order, error) {
-	// step.1 撤销活动订单并查询最终状态，遇到网络竞态时有限重试。
+	orderID int64, requestDelay time.Duration) (*futures.Order, error) {
+	// step.1 将活动挂单撤销并读取最终成交信息。
 	for attempt := 0; attempt < 3; attempt++ {
 		cancelled, cancelErr := e.client.NewCancelOrderService().
 			Symbol(symbol).OrderID(orderID).Do(ctx)
+		if requestDelay > 0 {
+			if err := waitRequestDelay(ctx, requestDelay); err != nil {
+				return nil, err
+			}
+		}
 		order, queryErr := e.client.NewGetOrderService().Symbol(symbol).OrderID(orderID).Do(ctx)
 		if queryErr == nil && order.Status != futures.OrderStatusTypeNew &&
 			order.Status != futures.OrderStatusTypePartiallyFilled {
@@ -310,6 +331,7 @@ func (e *Exchange) cancelAndReadEntry(ctx context.Context, symbol string,
 			return nil, ctx.Err()
 		}
 	}
+	// step.2 多次请求仍无法确认订单终态时返回错误，避免重复挂单。
 	return nil, fmt.Errorf("%s 无法确认 GTX 挂单 %d 已撤销", symbol, orderID)
 }
 
@@ -520,16 +542,34 @@ func positionStateKey(symbol string, direction futures.PositionSideType) string 
 
 // ManagePositions 按持仓方向处理止盈成交、趋势退出和保护单更新。
 func (e *Exchange) ManagePositions(ctx context.Context) error {
-	if !e.manageMu.TryLock() {
+	if !e.managing.CompareAndSwap(false, true) {
 		return nil
 	}
-	defer e.manageMu.Unlock()
+	defer e.managing.Store(false)
 	states := e.positionStatesSnapshot()
+	if len(states) == 0 {
+		return nil
+	}
 	managedStates := make(map[string]PositionState, len(states))
+	needAlgoOrders := false
 	for _, state := range states {
 		managedStates[positionStateKey(state.Symbol, state.Direction)] = state
+		if state.Direction == futures.PositionSideTypeLong && state.TakeProfitAlgoID != 0 {
+			needAlgoOrders = true
+		}
 	}
-	// step.1 读取当前账户仓位，确认策略管理状态仍对应真实仓位。
+	openAlgoOrders := make(map[int64]futures.GetAlgoOrderResp)
+	if needAlgoOrders {
+		// step.1 批量读取全部活动条件单，避免逐个仓位查询止盈单。
+		orders, err := e.client.NewListOpenAlgoOrdersService().Do(ctx)
+		if err != nil {
+			return fmt.Errorf("批量读取活动条件单: %w", err)
+		}
+		for _, order := range orders {
+			openAlgoOrders[order.AlgoId] = order
+		}
+	}
+	// step.2 批量读取当前账户仓位，确认策略管理状态仍对应真实仓位。
 	positions, err := e.client.NewGetPositionRiskService().Do(ctx)
 	if err != nil {
 		return fmt.Errorf("读取持仓管理仓位: %w", err)
@@ -548,11 +588,11 @@ func (e *Exchange) ManagePositions(ctx context.Context) error {
 		if !managed {
 			continue
 		}
-		if err := e.managePosition(ctx, state, math.Abs(amount)); err != nil {
+		if err := e.managePosition(ctx, state, math.Abs(amount), openAlgoOrders); err != nil {
 			return fmt.Errorf("管理 %s %s 仓位: %w", position.Symbol, direction, err)
 		}
 	}
-	// step.2 清除已经完全平仓的策略状态及遗留保护单。
+	// step.3 清除已经完全平仓的策略状态及遗留保护单。
 	for _, state := range states {
 		found := false
 		for _, position := range positions {
@@ -564,7 +604,13 @@ func (e *Exchange) ManagePositions(ctx context.Context) error {
 			}
 		}
 		if !found {
+			if err := waitPositionRequest(ctx); err != nil {
+				return err
+			}
 			_ = e.cancelAlgoOrder(ctx, state.TakeProfitAlgoID)
+			if err := waitPositionRequest(ctx); err != nil {
+				return err
+			}
 			_ = e.cancelAlgoOrder(ctx, state.StopLossAlgoID)
 			if err := e.savePositionState(PositionState{Symbol: state.Symbol, Direction: state.Direction}); err != nil {
 				return err
@@ -586,7 +632,10 @@ func (e *Exchange) positionStatesSnapshot() []PositionState {
 }
 
 // managePosition 根据多头止盈成交或空头盈利趋势更新订单状态。
-func (e *Exchange) managePosition(ctx context.Context, state PositionState, quantity float64) error {
+func (e *Exchange) managePosition(
+	ctx context.Context, state PositionState, quantity float64,
+	openAlgoOrders map[int64]futures.GetAlgoOrderResp,
+) error {
 	filter, ok := e.market.Filter(state.Symbol)
 	if !ok {
 		return fmt.Errorf("缺少交易规则")
@@ -597,7 +646,8 @@ func (e *Exchange) managePosition(ctx context.Context, state PositionState, quan
 	}
 	direction := orderDirectionFor(state.Direction)
 	if state.Direction == futures.PositionSideTypeLong {
-		return e.manageLongPosition(ctx, state, quantity, price, filter, direction)
+		return e.manageLongPosition(ctx, state, quantity, price, filter,
+			direction, openAlgoOrders)
 	}
 	state.Quantity = quantity
 	return e.manageShortPosition(ctx, state, price, filter, direction)
@@ -607,10 +657,17 @@ func (e *Exchange) managePosition(ctx context.Context, state PositionState, quan
 func (e *Exchange) manageLongPosition(
 	ctx context.Context, state PositionState, quantity, price float64,
 	filter SymbolFilter, direction orderDirection,
+	openAlgoOrders map[int64]futures.GetAlgoOrderResp,
 ) error {
 	if quantity >= state.Quantity-1e-12 {
 		if state.TakeProfitAlgoID == 0 {
 			return nil
+		}
+		if _, active := openAlgoOrders[state.TakeProfitAlgoID]; active {
+			return nil
+		}
+		if err := waitPositionRequest(ctx); err != nil {
+			return err
 		}
 		order, err := e.client.NewGetAlgoOrderService().AlgoID(state.TakeProfitAlgoID).Do(ctx)
 		if err != nil {
@@ -623,6 +680,9 @@ func (e *Exchange) manageLongPosition(
 			actualID, parseErr := strconv.ParseInt(order.ActualOrderId, 10, 64)
 			if parseErr != nil {
 				return fmt.Errorf("解析止盈触发订单编号: %w", parseErr)
+			}
+			if err := waitPositionRequest(ctx); err != nil {
+				return err
 			}
 			actual, queryErr := e.client.NewGetOrderService().Symbol(state.Symbol).
 				OrderID(actualID).Do(ctx)
@@ -638,7 +698,13 @@ func (e *Exchange) manageLongPosition(
 	}
 	state.Quantity = quantity
 	if state.TakeProfitAlgoID != 0 {
+		if err := waitPositionRequest(ctx); err != nil {
+			return err
+		}
 		if cancelErr := e.cancelAlgoOrder(ctx, state.TakeProfitAlgoID); cancelErr != nil {
+			if err := waitPositionRequest(ctx); err != nil {
+				return err
+			}
 			order, queryErr := e.client.NewGetAlgoOrderService().
 				AlgoID(state.TakeProfitAlgoID).Do(ctx)
 			if queryErr != nil {
@@ -651,6 +717,9 @@ func (e *Exchange) manageLongPosition(
 				actualID, parseErr := strconv.ParseInt(order.ActualOrderId, 10, 64)
 				if parseErr != nil {
 					return fmt.Errorf("解析止盈触发订单编号: %w", parseErr)
+				}
+				if err := waitPositionRequest(ctx); err != nil {
+					return err
 				}
 				actual, queryErr := e.client.NewGetOrderService().Symbol(state.Symbol).
 					OrderID(actualID).Do(ctx)
@@ -666,6 +735,9 @@ func (e *Exchange) manageLongPosition(
 	}
 	// step.1 先创建基于最新报价的新止损，再撤销旧止损保护。
 	stopPrice := help_nearestStep(price*(1-e.cfg.StopLossRate), filter.PriceTick)
+	if err := waitPositionRequest(ctx); err != nil {
+		return err
+	}
 	stop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
 	if err != nil {
 		return err
@@ -674,12 +746,19 @@ func (e *Exchange) manageLongPosition(
 	state.StopLossAlgoID = stop.AlgoId
 	state.StopLossPrice = stopPrice
 	// step.2 按当前剩余数量创建下一张部分止盈单并持久化新状态。
+	if err := waitPositionRequest(ctx); err != nil {
+		_ = e.cancelAlgoOrder(ctx, stop.AlgoId)
+		return err
+	}
 	state, err = e.replaceLongTakeProfit(ctx, state, price, quantity, filter, direction)
 	if err != nil {
 		_ = e.cancelAlgoOrder(ctx, stop.AlgoId)
 		return err
 	}
 	if err := e.savePositionState(state); err != nil {
+		return err
+	}
+	if err := waitPositionRequest(ctx); err != nil {
 		return err
 	}
 	return e.cancelAlgoOrder(ctx, oldStopID)
@@ -714,6 +793,9 @@ func (e *Exchange) manageShortPosition(
 	if math.Abs(stopPrice-state.StopLossPrice) < filter.PriceTick*0.5 {
 		return nil
 	}
+	if err := waitPositionRequest(ctx); err != nil {
+		return err
+	}
 	newStop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
 	if err != nil {
 		return err
@@ -727,7 +809,27 @@ func (e *Exchange) manageShortPosition(
 		_ = e.cancelAlgoOrder(ctx, newStop.AlgoId)
 		return err
 	}
+	if err := waitPositionRequest(ctx); err != nil {
+		return err
+	}
 	return e.cancelAlgoOrder(ctx, oldStopID)
+}
+
+// waitPositionRequest 在不持有状态锁时限制逐笔持仓管理请求的发送速度。
+func waitPositionRequest(ctx context.Context) error {
+	return waitRequestDelay(ctx, 100*time.Millisecond)
+}
+
+// waitRequestDelay 在上下文可取消的前提下等待逐个 API 请求之间的间隔。
+func waitRequestDelay(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // closeMaker 按被动限价持续重挂空头退出单，并保留交易所止损保护。
@@ -747,6 +849,9 @@ func (e *Exchange) closeMaker(
 		var created *futures.CreateOrderResponse
 		var err error
 		for rejects := 0; rejects < 5; rejects++ {
+			if err := waitPositionRequest(ctx); err != nil {
+				return err
+			}
 			// 调用本目录辅助函数，按交易所价格步进格式化被动退出价和数量。
 			created, err = e.client.NewCreateOrderService().Symbol(state.Symbol).
 				Side(direction.exitSide).PositionSide(direction.positionSide).
@@ -766,7 +871,7 @@ func (e *Exchange) closeMaker(
 		if created == nil {
 			return fmt.Errorf("%s GTX 退出订单连续穿价拒绝", state.Symbol)
 		}
-		order, err := e.waitAndCancelEntry(ctx, state.Symbol, created.OrderID,
+		order, err := e.waitAndCancelManagedEntry(ctx, state.Symbol, created.OrderID,
 			time.Duration(e.cfg.EntryRepriceSeconds*float64(time.Second)))
 		if err != nil {
 			return err
