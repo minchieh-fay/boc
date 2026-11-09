@@ -105,19 +105,16 @@ func (a *Application) handleTradeCycle(ctx context.Context) {
 		if positions[candidate.Symbol] || openedSymbols[candidate.Symbol] {
 			continue
 		}
-		directionCount := 1
-		tradeMode := a.cfg.TradeMode
-		if a.cfg.TradeMode == 2 {
-			directionCount = 2
-		} else if a.cfg.TradeMode == 3 {
-			var ok bool
-			tradeMode, ok = a.market.TrendMode(candidate.Symbol)
-			if !ok {
-				log.Printf("trend signal skipped symbol=%s: incomplete kline window", candidate.Symbol)
-				continue
-			}
+		trendMode, ok := a.market.TrendMode(candidate.Symbol)
+		if !ok {
+			log.Printf("trend signal skipped symbol=%s: incomplete kline window", candidate.Symbol)
+			continue
 		}
-		if positionCount+directionCount > a.cfg.MaxSymbols {
+		tradeMode := trendMode
+		if a.cfg.TradeMode == 1 && trendMode != 0 || a.cfg.TradeMode == 2 && trendMode != 1 {
+			continue
+		}
+		if positionCount+1 > a.cfg.MaxSymbols {
 			break
 		}
 		// step.3 按配置方向使用 GTX 限价挂单开仓并挂保护单。

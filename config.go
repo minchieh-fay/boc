@@ -30,7 +30,7 @@ func loadConfig(path string) (Config, error) {
 	// step.1 准备策略默认值，并要求部署方预先提供配置文件。
 	cfg := Config{
 		KeyFile: "/root/key", KlineCount: 12, TradeIntervalSecond: 20,
-		TradeMode: 0, EntryRepriceSeconds: 1.5, EntryTimeoutSeconds: 300,
+		TradeMode: 3, EntryRepriceSeconds: 1.5, EntryTimeoutSeconds: 300,
 		TradeUSDT: 100, MaxSymbols: 2, TakeProfitRate: 0.03, StopLossRate: 0.1,
 		MinMoveRate: 0.2, Leverage: 1,
 		ReceiveWindowMillis: 5000, StalePriceSeconds: 30,
@@ -62,12 +62,9 @@ func (c Config) validate() error {
 	if c.KlineCount > 1499 {
 		return fmt.Errorf("kline_count 不能超过 1499，以便额外请求当前未收盘 K 线")
 	}
-	if c.TradeMode < 0 || c.TradeMode > 3 || c.EntryRepriceSeconds <= 0 ||
+	if c.TradeMode < 1 || c.TradeMode > 3 || c.EntryRepriceSeconds <= 0 ||
 		c.EntryRepriceSeconds < 0.1 || float64(c.EntryTimeoutSeconds) < c.EntryRepriceSeconds {
-		return fmt.Errorf("trade_mode 必须为 0、1、2 或 3，重挂间隔至少 0.1 秒且不能超过挂单超时")
-	}
-	if c.TradeMode == 2 && c.MaxSymbols < 2 {
-		return fmt.Errorf("双向模式下 max_symbols 至少为 2")
+		return fmt.Errorf("trade_mode 必须为 1、2 或 3，重挂间隔至少 0.1 秒且不能超过挂单超时")
 	}
 	if c.TakeProfitRate <= 0 || c.TakeProfitRate >= 1 || c.StopLossRate <= 0 ||
 		c.StopLossRate >= 1 || c.MinMoveRate <= 0 {

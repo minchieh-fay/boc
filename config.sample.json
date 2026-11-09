@@ -2,7 +2,7 @@
   "keyfile": "/root/key",
   "kline_count": 12,
   "trade_interval_seconds": 20,
-  "trade_mode": 0,
+  "trade_mode": 3,
   "entry_reprice_seconds": 1.5,
   "entry_timeout_seconds": 300,
   "trade_usdt": 100,

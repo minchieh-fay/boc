@@ -202,7 +202,7 @@ func (m *MarketData) LastPrice(symbol string) (float64, bool) {
 	return queue.LastPrice, true
 }
 
-// TrendMode 比较历史队列前后两段的 High 总和并返回单边交易模式。
+// TrendMode 比较历史队列前后两段的 High 与 Low 总和并返回趋势方向。
 func (m *MarketData) TrendMode(symbol string) (int, bool) {
 	// step.1 取得完整历史窗口并按照策略定义切分前后两段。
 	m.mu.RLock()
@@ -212,19 +212,20 @@ func (m *MarketData) TrendMode(symbol string) (int, bool) {
 		return 0, false
 	}
 	frontCount := (m.count + 1) / 2
-	frontHigh, backHigh := 0.0, 0.0
+	frontRange, backRange := 0.0, 0.0
 	for index, kline := range queue.Data {
 		if index < frontCount {
-			frontHigh += kline.High
+			frontRange += kline.High + kline.Low
 			continue
 		}
-		backHigh += kline.High
+		backRange += kline.High + kline.Low
 	}
 	if m.count%2 == 1 {
-		backHigh += queue.Data[m.count-1].High
+		last := queue.Data[m.count-1]
+		backRange += last.High + last.Low
 	}
 	// step.2 后半段总和变大时做多，否则做空。
-	if backHigh > frontHigh {
+	if backRange > frontRange {
 		return 0, true
 	}
 	return 1, true

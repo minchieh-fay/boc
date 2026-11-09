@@ -297,9 +297,9 @@ func tradeDirections(mode int) []orderDirection {
 	short := orderDirection{name: "short", positionSide: futures.PositionSideTypeShort,
 		entrySide: futures.SideTypeSell, exitSide: futures.SideTypeBuy}
 	switch mode {
-	case 0:
+	case 0, 1:
 		return []orderDirection{long}
-	case 1:
+	case 2:
 		return []orderDirection{short}
 	default:
 		return []orderDirection{long, short}
