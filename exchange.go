@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adshao/go-binance/v2/futures"
@@ -14,9 +18,26 @@ import (
 
 // Exchange 封装行情初始化、账户仓位读取和真实下单流程。
 type Exchange struct {
-	client *futures.Client
-	cfg    Config
-	market *MarketData
+	client        *futures.Client
+	cfg           Config
+	market        *MarketData
+	stateMu       sync.Mutex
+	manageMu      sync.Mutex
+	positionState map[string]PositionState
+}
+
+// PositionState 保存策略仓位和保护单信息，供进程重启后继续管理。
+type PositionState struct {
+	Symbol              string                   `json:"symbol"`
+	Direction           futures.PositionSideType `json:"direction"`
+	Quantity            float64                  `json:"quantity"`
+	EntryPrice          float64                  `json:"entry_price"`
+	AnchorPrice         float64                  `json:"anchor_price"`
+	StopLossPrice       float64                  `json:"stop_loss_price"`
+	TakeProfitAlgoID    int64                    `json:"take_profit_algo_id"`
+	StopLossAlgoID      int64                    `json:"stop_loss_algo_id"`
+	ProfitTargetReached bool                     `json:"profit_target_reached"`
+	ExitStarted         bool                     `json:"exit_started"`
 }
 
 // NewExchange 从两行密钥文件创建 Binance USDⓈ-M 合约客户端。
@@ -34,7 +55,12 @@ func NewExchange(cfg Config, market *MarketData) (*Exchange, error) {
 		futures.UseTestnet = true
 	}
 	client := futures.NewClient(lines[0], lines[1])
-	return &Exchange{client: client, cfg: cfg, market: market}, nil
+	exchange := &Exchange{client: client, cfg: cfg, market: market,
+		positionState: make(map[string]PositionState)}
+	if err := exchange.loadPositionState(); err != nil {
+		return nil, err
+	}
+	return exchange, nil
 }
 
 // Initialize 加载可交易合约信息和本地下单规则。
@@ -158,11 +184,22 @@ func (e *Exchange) openDirection(ctx context.Context, symbol string, price float
 		defer cancelProtect()
 	}
 	// step.2 按加权成交价为真实成交仓位设置止盈和止损保护。
-	if protectErr := e.placeProtection(protectCtx, symbol, entry, filter, direction); protectErr != nil {
+	state, protectErr := e.placeInitialProtection(
+		protectCtx, symbol, entry, filled, filter, direction,
+	)
+	if protectErr != nil {
 		if closeErr := e.closeDirection(protectCtx, symbol, filledText, direction); closeErr != nil {
 			return fmt.Errorf("%s 保护单失败: %v；紧急平仓也失败: %w", symbol, protectErr, closeErr)
 		}
 		return fmt.Errorf("%s 保护单失败，已紧急平仓: %w", symbol, protectErr)
+	}
+	if err := e.savePositionState(state); err != nil {
+		_ = e.cancelAlgoOrder(protectCtx, state.TakeProfitAlgoID)
+		_ = e.cancelAlgoOrder(protectCtx, state.StopLossAlgoID)
+		if closeErr := e.closeDirection(protectCtx, symbol, filledText, direction); closeErr != nil {
+			return fmt.Errorf("%s 保存管理状态失败: %v；紧急平仓失败: %w", symbol, err, closeErr)
+		}
+		return fmt.Errorf("%s 保存管理状态失败，已紧急平仓: %w", symbol, err)
 	}
 	// 调用本目录辅助函数输出真实成交数量和均价。
 	help_logTrade(symbol, direction.name, entry, 0, filled)
@@ -297,9 +334,9 @@ func tradeDirections(mode int) []orderDirection {
 	short := orderDirection{name: "short", positionSide: futures.PositionSideTypeShort,
 		entrySide: futures.SideTypeSell, exitSide: futures.SideTypeBuy}
 	switch mode {
-	case 0, 1:
+	case 0:
 		return []orderDirection{long}
-	case 2:
+	case 1:
 		return []orderDirection{short}
 	default:
 		return []orderDirection{long, short}
@@ -322,42 +359,437 @@ func nextMakerPrice(price, tick float64, side futures.SideType) float64 {
 	return price + tick
 }
 
-// placeProtection 为指定持仓方向挂止盈和止损市价条件单。
-func (e *Exchange) placeProtection(ctx context.Context, symbol string, entry float64, filter SymbolFilter, direction orderDirection) error {
-	// step.1 按持仓方向计算并对齐止盈、止损触发价。
-	takePrice, stopPrice := entry, entry
-	if direction.positionSide == futures.PositionSideTypeLong {
-		takePrice *= 1 + e.cfg.TakeProfitRate
-		stopPrice *= 1 - e.cfg.StopLossRate
-	} else {
-		takePrice *= 1 - e.cfg.TakeProfitRate
-		stopPrice *= 1 + e.cfg.StopLossRate
+// placeInitialProtection 按多空策略创建初始止盈止损保护单。
+func (e *Exchange) placeInitialProtection(
+	ctx context.Context, symbol string, entry, quantity float64,
+	filter SymbolFilter, direction orderDirection,
+) (PositionState, error) {
+	state := PositionState{
+		Symbol: symbol, Direction: direction.positionSide, Quantity: quantity,
+		EntryPrice: entry, AnchorPrice: entry,
 	}
-	// 调用本目录辅助函数，将两个条件价对齐交易所的价格步进。
-	takePrice = help_nearestStep(takePrice, filter.PriceTick)
-	stopPrice = help_nearestStep(stopPrice, filter.PriceTick)
-	// step.2 提交平仓方向一致、使用标记价格触发的两张条件单。
-	var placedIDs []int64
-	for _, protection := range []struct {
-		typ   futures.AlgoOrderType
-		price float64
-	}{{futures.AlgoOrderTypeTakeProfitMarket, takePrice}, {futures.AlgoOrderTypeStopMarket, stopPrice}} {
-		// 调用本目录辅助函数，按交易所价格精度格式化保护单触发价。
-		created, err := e.client.NewCreateAlgoOrderService().Symbol(symbol).Side(direction.exitSide).
-			PositionSide(direction.positionSide).Type(protection.typ).ClosePosition(true).
-			TriggerPrice(help_formatStep(protection.price, filter.PriceTick)).WorkingType(futures.WorkingTypeMarkPrice).
-			Do(ctx)
-		if err != nil {
-			for _, algoID := range placedIDs {
-				if _, cancelErr := e.client.NewCancelAlgoOrderService().AlgoID(algoID).Do(ctx); cancelErr != nil {
-					return fmt.Errorf("创建保护单失败: %v；撤销已创建条件单 %d 失败: %w", err, algoID, cancelErr)
-				}
-			}
-			return err
-		}
-		placedIDs = append(placedIDs, created.AlgoId)
+	stopRate := 1 + e.cfg.StopLossRate
+	if direction.positionSide == futures.PositionSideTypeLong {
+		stopRate = 1 - e.cfg.StopLossRate
+	}
+	// 调用本目录辅助函数，将初始止损价对齐到交易所价格步进。
+	stopPrice := help_nearestStep(entry*stopRate, filter.PriceTick)
+	state.StopLossPrice = stopPrice
+	stopOrder, err := e.createStopLoss(ctx, symbol, stopPrice, filter, direction)
+	if err != nil {
+		return PositionState{}, err
+	}
+	state.StopLossAlgoID = stopOrder.AlgoId
+	if direction.positionSide == futures.PositionSideTypeShort {
+		return state, nil
+	}
+	// step.1 多头开仓时同时设置全量止损和首笔部分止盈。
+	stopAlgoID := state.StopLossAlgoID
+	state, err = e.replaceLongTakeProfit(ctx, state, entry, quantity, filter, direction)
+	if err != nil {
+		_ = e.cancelAlgoOrder(ctx, stopAlgoID)
+		return PositionState{}, err
+	}
+	// step.2 返回止盈、止损条件单编号供持仓状态恢复使用。
+	return state, nil
+}
+
+// createStopLoss 创建指定仓位方向的全量止损条件单。
+func (e *Exchange) createStopLoss(
+	ctx context.Context, symbol string, price float64, filter SymbolFilter,
+	direction orderDirection,
+) (*futures.CreateAlgoOrderResp, error) {
+	// 调用本目录辅助函数，按交易所价格精度格式化止损触发价。
+	priceText := help_formatStep(price, filter.PriceTick)
+	return e.client.NewCreateAlgoOrderService().Symbol(symbol).Side(direction.exitSide).
+		PositionSide(direction.positionSide).Type(futures.AlgoOrderTypeStopMarket).
+		ClosePosition(true).TriggerPrice(priceText).
+		WorkingType(futures.WorkingTypeMarkPrice).Do(ctx)
+}
+
+// replaceLongTakeProfit 按锚点和仓位余量创建多头部分止盈条件单。
+func (e *Exchange) replaceLongTakeProfit(
+	ctx context.Context, state PositionState, anchor, quantity float64,
+	filter SymbolFilter, direction orderDirection,
+) (PositionState, error) {
+	// step.1 根据余仓 10% 和最小名义金额计算止盈数量。
+	if quantity <= 0 {
+		return PositionState{}, fmt.Errorf("%s 多头止盈数量无效", state.Symbol)
+	}
+	// 调用本目录辅助函数，将新止盈价格对齐到交易所价格步进。
+	profitPrice := help_nearestStep(anchor*(1+e.cfg.TakeProfitRate), filter.PriceTick)
+	profitQty := quantity * 0.1
+	minimumValue := e.cfg.TradeUSDT * e.cfg.TakeProfitRate
+	if quantity*anchor <= minimumValue {
+		profitQty = quantity
+	} else if profitQty*anchor < minimumValue {
+		profitQty = minimumValue / anchor
+	}
+	profitQty = math.Round(profitQty/filter.QtyStep) * filter.QtyStep
+	if profitQty < filter.MinQty {
+		profitQty = math.Ceil(filter.MinQty/filter.QtyStep-1e-12) * filter.QtyStep
+	}
+	if profitQty > quantity {
+		profitQty = quantity
+	}
+	if profitQty < filter.MinQty {
+		return PositionState{}, fmt.Errorf("%s 多头止盈数量低于交易所最小数量", state.Symbol)
+	}
+	// step.2 按锚点止盈价提交部分止盈条件单并返回关联 ID。
+	// 调用本目录辅助函数，按交易所步进格式化止盈数量和触发价。
+	quantityText := help_formatStep(profitQty, filter.QtyStep)
+	priceText := help_formatStep(profitPrice, filter.PriceTick)
+	created, err := e.client.NewCreateAlgoOrderService().Symbol(state.Symbol).
+		Side(direction.exitSide).PositionSide(direction.positionSide).
+		Type(futures.AlgoOrderTypeTakeProfitMarket).
+		Quantity(quantityText).TriggerPrice(priceText).
+		WorkingType(futures.WorkingTypeMarkPrice).Do(ctx)
+	if err != nil {
+		return PositionState{}, err
+	}
+	log.Printf("partial take-profit armed symbol=%s quantity=%s trigger=%s algo_id=%d",
+		state.Symbol, quantityText, priceText, created.AlgoId)
+	state.TakeProfitAlgoID = created.AlgoId
+	state.AnchorPrice = anchor
+	state.Quantity = quantity
+	return state, nil
+}
+
+// cancelAlgoOrder 撤销指定的活动条件单。
+func (e *Exchange) cancelAlgoOrder(ctx context.Context, algoID int64) error {
+	if algoID == 0 {
+		return nil
+	}
+	_, err := e.client.NewCancelAlgoOrderService().AlgoID(algoID).Do(ctx)
+	return err
+}
+
+// loadPositionState 从本地状态文件恢复策略持仓和条件单关联信息。
+func (e *Exchange) loadPositionState() error {
+	data, err := os.ReadFile("data/position_state.json")
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取持仓管理状态: %w", err)
+	}
+	var states []PositionState
+	if err := json.Unmarshal(data, &states); err != nil {
+		return fmt.Errorf("解析持仓管理状态: %w", err)
+	}
+	for _, state := range states {
+		e.positionState[positionStateKey(state.Symbol, state.Direction)] = state
 	}
 	return nil
+}
+
+// savePositionState 更新一个方向的持仓状态并原子写入状态文件。
+func (e *Exchange) savePositionState(state PositionState) error {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	// step.1 更新方向仓位状态并生成完整 JSON 快照。
+	key := positionStateKey(state.Symbol, state.Direction)
+	if state.Quantity <= 0 {
+		delete(e.positionState, key)
+	} else {
+		e.positionState[key] = state
+	}
+	states := make([]PositionState, 0, len(e.positionState))
+	for _, current := range e.positionState {
+		states = append(states, current)
+	}
+	data, err := json.MarshalIndent(states, "", "  ")
+	if err != nil {
+		return err
+	}
+	// step.2 创建状态目录并通过临时文件原子替换持久化快照。
+	if err := os.MkdirAll("data", 0755); err != nil {
+		return err
+	}
+	temporary := filepath.Join("data", "position_state.json.tmp")
+	if err := os.WriteFile(temporary, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(temporary, filepath.Join("data", "position_state.json"))
+}
+
+// positionStateKey 生成交易对与持仓方向组合的状态索引。
+func positionStateKey(symbol string, direction futures.PositionSideType) string {
+	return symbol + ":" + string(direction)
+}
+
+// ManagePositions 按持仓方向处理止盈成交、趋势退出和保护单更新。
+func (e *Exchange) ManagePositions(ctx context.Context) error {
+	if !e.manageMu.TryLock() {
+		return nil
+	}
+	defer e.manageMu.Unlock()
+	states := e.positionStatesSnapshot()
+	managedStates := make(map[string]PositionState, len(states))
+	for _, state := range states {
+		managedStates[positionStateKey(state.Symbol, state.Direction)] = state
+	}
+	// step.1 读取当前账户仓位，确认策略管理状态仍对应真实仓位。
+	positions, err := e.client.NewGetPositionRiskService().Do(ctx)
+	if err != nil {
+		return fmt.Errorf("读取持仓管理仓位: %w", err)
+	}
+	for _, position := range positions {
+		amount, parseErr := strconv.ParseFloat(position.PositionAmt, 64)
+		if parseErr != nil || amount == 0 {
+			continue
+		}
+		direction := futures.PositionSideTypeLong
+		if strings.EqualFold(position.PositionSide, "SHORT") {
+			direction = futures.PositionSideTypeShort
+		}
+		key := positionStateKey(position.Symbol, direction)
+		state, managed := managedStates[key]
+		if !managed {
+			continue
+		}
+		if err := e.managePosition(ctx, state, math.Abs(amount)); err != nil {
+			return fmt.Errorf("管理 %s %s 仓位: %w", position.Symbol, direction, err)
+		}
+	}
+	// step.2 清除已经完全平仓的策略状态及遗留保护单。
+	for _, state := range states {
+		found := false
+		for _, position := range positions {
+			if position.Symbol == state.Symbol &&
+				strings.EqualFold(position.PositionSide, string(state.Direction)) {
+				amount, _ := strconv.ParseFloat(position.PositionAmt, 64)
+				found = amount != 0
+				break
+			}
+		}
+		if !found {
+			_ = e.cancelAlgoOrder(ctx, state.TakeProfitAlgoID)
+			_ = e.cancelAlgoOrder(ctx, state.StopLossAlgoID)
+			if err := e.savePositionState(PositionState{Symbol: state.Symbol, Direction: state.Direction}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// positionStatesSnapshot 返回持仓状态快照，避免持锁期间调用交易所接口。
+func (e *Exchange) positionStatesSnapshot() []PositionState {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	states := make([]PositionState, 0, len(e.positionState))
+	for _, state := range e.positionState {
+		states = append(states, state)
+	}
+	return states
+}
+
+// managePosition 根据多头止盈成交或空头盈利趋势更新订单状态。
+func (e *Exchange) managePosition(ctx context.Context, state PositionState, quantity float64) error {
+	filter, ok := e.market.Filter(state.Symbol)
+	if !ok {
+		return fmt.Errorf("缺少交易规则")
+	}
+	price, ok := e.market.LastPrice(state.Symbol)
+	if !ok || price <= 0 {
+		return fmt.Errorf("缺少最新报价")
+	}
+	direction := orderDirectionFor(state.Direction)
+	if state.Direction == futures.PositionSideTypeLong {
+		return e.manageLongPosition(ctx, state, quantity, price, filter, direction)
+	}
+	state.Quantity = quantity
+	return e.manageShortPosition(ctx, state, price, filter, direction)
+}
+
+// manageLongPosition 在部分止盈成交后按最新报价重新设置止盈和止损。
+func (e *Exchange) manageLongPosition(
+	ctx context.Context, state PositionState, quantity, price float64,
+	filter SymbolFilter, direction orderDirection,
+) error {
+	if quantity >= state.Quantity-1e-12 {
+		if state.TakeProfitAlgoID == 0 {
+			return nil
+		}
+		order, err := e.client.NewGetAlgoOrderService().AlgoID(state.TakeProfitAlgoID).Do(ctx)
+		if err != nil {
+			return err
+		}
+		if order.AlgoStatus == futures.AlgoOrderStatusTypeNew {
+			return nil
+		}
+		if order.ActualOrderId != "" {
+			actualID, parseErr := strconv.ParseInt(order.ActualOrderId, 10, 64)
+			if parseErr != nil {
+				return fmt.Errorf("解析止盈触发订单编号: %w", parseErr)
+			}
+			actual, queryErr := e.client.NewGetOrderService().Symbol(state.Symbol).
+				OrderID(actualID).Do(ctx)
+			if queryErr != nil {
+				return queryErr
+			}
+			if actual.Status == futures.OrderStatusTypeNew ||
+				actual.Status == futures.OrderStatusTypePartiallyFilled ||
+				actual.Status == futures.OrderStatusTypeFilled {
+				return nil
+			}
+		}
+	}
+	state.Quantity = quantity
+	if state.TakeProfitAlgoID != 0 {
+		if cancelErr := e.cancelAlgoOrder(ctx, state.TakeProfitAlgoID); cancelErr != nil {
+			order, queryErr := e.client.NewGetAlgoOrderService().
+				AlgoID(state.TakeProfitAlgoID).Do(ctx)
+			if queryErr != nil {
+				return fmt.Errorf("撤销旧止盈单失败: %v；查询订单状态失败: %w", cancelErr, queryErr)
+			}
+			if order.AlgoStatus == futures.AlgoOrderStatusTypeNew {
+				return cancelErr
+			}
+			if order.ActualOrderId != "" {
+				actualID, parseErr := strconv.ParseInt(order.ActualOrderId, 10, 64)
+				if parseErr != nil {
+					return fmt.Errorf("解析止盈触发订单编号: %w", parseErr)
+				}
+				actual, queryErr := e.client.NewGetOrderService().Symbol(state.Symbol).
+					OrderID(actualID).Do(ctx)
+				if queryErr != nil {
+					return queryErr
+				}
+				if actual.Status == futures.OrderStatusTypeNew ||
+					actual.Status == futures.OrderStatusTypePartiallyFilled {
+					return cancelErr
+				}
+			}
+		}
+	}
+	// step.1 先创建基于最新报价的新止损，再撤销旧止损保护。
+	stopPrice := help_nearestStep(price*(1-e.cfg.StopLossRate), filter.PriceTick)
+	stop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
+	if err != nil {
+		return err
+	}
+	oldStopID := state.StopLossAlgoID
+	state.StopLossAlgoID = stop.AlgoId
+	state.StopLossPrice = stopPrice
+	// step.2 按当前剩余数量创建下一张部分止盈单并持久化新状态。
+	state, err = e.replaceLongTakeProfit(ctx, state, price, quantity, filter, direction)
+	if err != nil {
+		_ = e.cancelAlgoOrder(ctx, stop.AlgoId)
+		return err
+	}
+	if err := e.savePositionState(state); err != nil {
+		return err
+	}
+	return e.cancelAlgoOrder(ctx, oldStopID)
+}
+
+// manageShortPosition 按空头盈利阈值判断继续持有或启动限价平仓。
+func (e *Exchange) manageShortPosition(
+	ctx context.Context, state PositionState, price float64,
+	filter SymbolFilter, direction orderDirection,
+) error {
+	if state.ExitStarted {
+		return e.closeMaker(ctx, state, filter, direction)
+	}
+	// step.1 达到初始盈利阈值后，检查趋势并决定持有或开始退出。
+	if !state.ProfitTargetReached && price > state.EntryPrice*(1-e.cfg.TakeProfitRate) {
+		return nil
+	}
+	trend, ok := e.market.TrendMode(state.Symbol)
+	if !ok {
+		return nil
+	}
+	if trend != 1 {
+		state.ProfitTargetReached = true
+		state.ExitStarted = true
+		if err := e.savePositionState(state); err != nil {
+			return err
+		}
+		return e.closeMaker(ctx, state, filter, direction)
+	}
+	// step.2 趋势延续时，以最新报价重新挂止损并保留旧保护直到新单就绪。
+	stopPrice := help_nearestStep(price*(1+e.cfg.StopLossRate), filter.PriceTick)
+	if math.Abs(stopPrice-state.StopLossPrice) < filter.PriceTick*0.5 {
+		return nil
+	}
+	newStop, err := e.createStopLoss(ctx, state.Symbol, stopPrice, filter, direction)
+	if err != nil {
+		return err
+	}
+	oldStopID := state.StopLossAlgoID
+	state.StopLossAlgoID = newStop.AlgoId
+	state.StopLossPrice = stopPrice
+	state.ProfitTargetReached = true
+	state.AnchorPrice = price
+	if err := e.savePositionState(state); err != nil {
+		_ = e.cancelAlgoOrder(ctx, newStop.AlgoId)
+		return err
+	}
+	return e.cancelAlgoOrder(ctx, oldStopID)
+}
+
+// closeMaker 按被动限价持续重挂空头退出单，并保留交易所止损保护。
+func (e *Exchange) closeMaker(
+	ctx context.Context, state PositionState, filter SymbolFilter,
+	direction orderDirection,
+) error {
+	// step.1 在配置的超时时间内持续按最新行情提交 GTX 平仓单。
+	deadline := time.Now().Add(time.Duration(e.cfg.EntryTimeoutSeconds) * time.Second)
+	remaining := state.Quantity
+	for time.Now().Before(deadline) {
+		price, ok := e.market.LastPrice(state.Symbol)
+		if !ok || price <= 0 {
+			return fmt.Errorf("缺少退出报价")
+		}
+		limitPrice := makerEntryPrice(price, filter.PriceTick, direction.exitSide)
+		var created *futures.CreateOrderResponse
+		var err error
+		for rejects := 0; rejects < 5; rejects++ {
+			// 调用本目录辅助函数，按交易所价格步进格式化被动退出价和数量。
+			created, err = e.client.NewCreateOrderService().Symbol(state.Symbol).
+				Side(direction.exitSide).PositionSide(direction.positionSide).
+				Type(futures.OrderTypeLimit).TimeInForce(futures.TimeInForceTypeGTX).
+				Quantity(help_formatStep(remaining, filter.QtyStep)).
+				Price(help_formatStep(limitPrice, filter.PriceTick)).
+				NewOrderResponseType(futures.NewOrderRespTypeRESULT).Do(ctx)
+			if err == nil {
+				break
+			}
+			// 调用本目录辅助函数，仅对 GTX 穿价错误向被动方向重试。
+			if !help_isPostOnlyCross(err) {
+				return err
+			}
+			limitPrice = nextMakerPrice(limitPrice, filter.PriceTick, direction.exitSide)
+		}
+		if created == nil {
+			return fmt.Errorf("%s GTX 退出订单连续穿价拒绝", state.Symbol)
+		}
+		order, err := e.waitAndCancelEntry(ctx, state.Symbol, created.OrderID,
+			time.Duration(e.cfg.EntryRepriceSeconds*float64(time.Second)))
+		if err != nil {
+			return err
+		}
+		// 调用本目录辅助函数，读取本次退出订单的最终成交数量。
+		filled, _ := orderFill(order)
+		remaining -= filled
+		if order.Status == futures.OrderStatusTypeFilled || remaining <= 0 {
+			return nil
+		}
+	}
+	// step.2 超时后保留交易所止损和持仓状态，后续周期继续尝试退出。
+	return nil
+}
+
+// orderDirectionFor 将交易所持仓方向转换成开平仓下单方向。
+func orderDirectionFor(side futures.PositionSideType) orderDirection {
+	if side == futures.PositionSideTypeLong {
+		return orderDirection{name: "long", positionSide: side,
+			entrySide: futures.SideTypeBuy, exitSide: futures.SideTypeSell}
+	}
+	return orderDirection{name: "short", positionSide: side,
+		entrySide: futures.SideTypeSell, exitSide: futures.SideTypeBuy}
 }
 
 // closeDirection 在保护单创建失败后用市价单关闭对应方向，限制保护缺失风险。

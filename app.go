@@ -55,6 +55,11 @@ func (a *Application) run(ctx context.Context) error {
 		case now := <-rotate.C:
 			log.Printf("rotated kline windows symbols=%d", a.market.Rotate(now, time.Minute))
 		case <-trade.C:
+			go func() {
+				if err := a.exchange.ManagePositions(ctx); err != nil {
+					log.Printf("position management cycle failed: %v", err)
+				}
+			}()
 			a.handleTradeCycle(ctx)
 		}
 	}
